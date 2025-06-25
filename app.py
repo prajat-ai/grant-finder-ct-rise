@@ -1,23 +1,27 @@
 # app.py ──────────────────────────────────────────────────────────
 """
-CT RISE Network – Smart Grant Finder
-Pulls grants from Grants.gov, ranks by semantic similarity to CT RISE’s mission,
-adds a GPT feasibility label, and displays everything in a Streamlit dashboard.
+CT RISE – Smart Grant Finder (GPT-powered version, no external APIs)
+• GPT-3.5 returns 25 education-focused grants in JSON.
+• OpenAI embeddings rank by similarity to CT RISE mission.
+• GPT adds a feasibility label + 1-sentence rationale on the top N.
 """
 
-import os, time, json, logging, requests, pandas as pd
+import os, time, json, logging
 import streamlit as st
+import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
 import openai
 
 # ── CONFIG ───────────────────────────────────────────────────────
-MAX_RESULTS   = 25        # grants pulled from API each refresh
-TOP_N_GPT     = 10        # only run GPT on top-N matches
-SLEEP_SECONDS = 2         # pause between OpenAI calls (rate-limit safety)
-RETRIES       = 3         # OpenAI retry attempts
+NUM_GRANTS    = 25       # GPT generates this many grants
+TOP_N_GPT     = 10       # run GPT feasibility on top-N
+SLEEP_SECONDS = 1        # delay per API call (rate-limit safety)
+RETRIES       = 3
+EMBED_MODEL   = "text-embedding-ada-002"
+CHAT_MODEL    = "gpt-3.5-turbo"          # free-tier friendly
 
-# ── KEYS ─────────────────────────────────────────────────────────
+# ── LOAD KEY ─────────────────────────────────────────────────────
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
@@ -30,119 +34,105 @@ CT_RISE_MISSION = (
 )
 
 # ── OPENAI HELPERS ───────────────────────────────────────────────
-def get_embedding(text: str, model: str = "text-embedding-ada-002") -> list[float]:
+def call_openai_chat(messages, model=CHAT_MODEL, max_tokens=800):
+    for attempt in range(RETRIES):
+        try:
+            resp = openai.ChatCompletion.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.7,
+            )
+            return resp.choices[0].message.content
+        except openai.error.RateLimitError:
+            time.sleep(5 * (attempt + 1))
+    raise RuntimeError("OpenAI rate-limit persisted.")
+
+def get_embedding(text, model=EMBED_MODEL):
     for attempt in range(RETRIES):
         try:
             resp = openai.Embedding.create(input=text, model=model)
             return resp["data"][0]["embedding"]
         except openai.error.RateLimitError:
             time.sleep(5 * (attempt + 1))
-    st.error("OpenAI rate-limit hit repeatedly.")
     return [0.0] * 1536
 
-def gpt_brief(mission: str, grant_row: pd.Series) -> tuple[str, str]:
-    prompt = (
-        f"Nonprofit mission:\n{mission}\n\n"
-        f"Grant title: {grant_row.title}\n"
-        f"Grant description: {grant_row.summary}\n\n"
-        'Respond ONLY in JSON like {"feasibility":"High","why":"<one sentence>"}'
-    )
-    for attempt in range(RETRIES):
-        try:
-            resp = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=60,
-                temperature=0.3,
-            )
-            data = json.loads(resp.choices[0].message.content.strip())
-            return data.get("feasibility", "Unknown"), data.get("why", "")
-        except (openai.error.RateLimitError, json.JSONDecodeError):
-            time.sleep(5 * (attempt + 1))
-    return "Unknown", "Could not parse GPT response."
-
-# ── GRANTS.GOV FETCHER ───────────────────────────────────────────
-@st.cache_data(ttl=86400)
-def fetch_grants(max_results: int = 25) -> pd.DataFrame:
-    base = "https://www.grants.gov/grantsws/rest/opportunities/search"
-    params = {
-        "keywords": "education high school youth college success",
-        "oppStatuses": "forecasted,posted",
-        "sortField": "openDate",
-        "sortOrder": "desc",
-        "pageSize": max_results,
-        "startRecordNum": 0,
+# ── 1. GPT: GENERATE GRANTS LIST ─────────────────────────────────
+def gpt_generate_grants(n=NUM_GRANTS):
+    sys = {"role": "system", "content": "You are a grants researcher."}
+    usr = {
+        "role": "user",
+        "content": (
+            f"Provide {n} CURRENT (2024-2025) grant opportunities for US nonprofits "
+            "focused on high-school education, college readiness, or youth equity. "
+            "Return ONLY valid JSON list like:\n"
+            '[{"title":"...", "sponsor":"...", "summary":"...", "deadline":"...", "url":"..."}]'
+        ),
     }
+    raw = call_openai_chat([sys, usr])
+    # Safe JSON load
     try:
-        r = requests.get(base, params=params, timeout=30, headers={"Accept": "application/json"})
-        r.raise_for_status()
-        hits = r.json().get("oppHits", [])
-    except Exception as e:
-        logging.warning(f"Grants.gov error: {e}")
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logging.error("GPT JSON parse failure.")
+        return []
+    return data[:n]
+
+# ── 2. RANK + FEASIBILITY ────────────────────────────────────────
+def rank_and_score(grants_json):
+    if not grants_json:
         return pd.DataFrame()
-
-    rows = []
-    for h in hits:
-        rows.append(
-            {
-                "title": h.get("oppTitle", "N/A"),
-                "agency": h.get("agency", ""),
-                "summary": h.get("synopsis", "")[:2000],
-                "deadline": h.get("closeDate", "N/A"),
-                "url": h.get("oppLink", ""),
-            }
-        )
-    return pd.DataFrame(rows)
-
-# ── RANK + GPT ANNOTATE ──────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=3600)
-def process_grants(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-
+    df = pd.DataFrame(grants_json)
     mission_vec = get_embedding(CT_RISE_MISSION)
     sims = []
-    for txt in df["summary"]:
-        vec = get_embedding(txt)
-        sims.append(float(cosine_similarity([vec], [mission_vec])[0][0]))
+    for descr in df["summary"]:
+        sims.append(float(cosine_similarity([get_embedding(descr)], [mission_vec])[0][0]))
         time.sleep(SLEEP_SECONDS)
     df["similarity"] = sims
-
     df = df.sort_values("similarity", ascending=False).head(TOP_N_GPT).reset_index(drop=True)
 
-    feasibilities, whys = [], []
+    feas, why = [], []
     for _, row in df.iterrows():
-        f, w = gpt_brief(CT_RISE_MISSION, row)
-        feasibilities.append(f)
-        whys.append(w)
+        prompt = (
+            f'Nonprofit mission: "{CT_RISE_MISSION}"\n\n'
+            f'Grant: "{row.title}" – {row.summary}\n\n'
+            'Answer ONLY JSON like {"feasibility":"High","why":"<one sentence>"}'
+        )
+        j = call_openai_chat([{"role": "user", "content": prompt}], max_tokens=60)
+        try:
+            parsed = json.loads(j)
+            feas.append(parsed.get("feasibility", "Unknown"))
+            why.append(parsed.get("why", ""))
+        except json.JSONDecodeError:
+            feas.append("Unknown")
+            why.append("Could not parse")
         time.sleep(SLEEP_SECONDS)
-    df["feasibility"] = feasibilities
-    df["why_fit"]    = whys
+    df["feasibility"] = feas
+    df["why_fit"]    = why
     return df
 
 # ── STREAMLIT UI ─────────────────────────────────────────────────
-st.title("CT RISE Network — Smart Grant Finder")
-
+st.title("CT RISE Network — Smart Grant Finder (GPT version)")
 st.markdown(
     "> **Mission**: The Connecticut RISE Network empowers public high schools with data-driven "
-    "strategies and personalized support to improve student outcomes and promote post-secondary success, "
-    "especially for Black, Latinx, and low-income youth."
+    "strategies and personalized support to improve student outcomes, especially for "
+    "Black, Latinx, and low-income youth."
 )
 
-if st.button("🔄 Refresh grants & rank"):
-    with st.spinner("Contacting Grants.gov and OpenAI… this can take ~1 min"):
-        raw_df   = fetch_grants(MAX_RESULTS)
-        ranked   = process_grants(raw_df)
-        st.session_state["grants"] = ranked
-        st.success("Updated!")
+if st.button("🔄 Generate & rank grants"):
+    with st.spinner("Talking to GPT… please wait ≈1-2 min"):
+        grants_raw = gpt_generate_grants()
+        table      = rank_and_score(grants_raw)
+        st.session_state["grants"] = table
+        st.success("Done!")
 
 if "grants" in st.session_state and not st.session_state["grants"].empty:
     st.subheader("Top matched grants")
     st.dataframe(
-        st.session_state["grants"][["title", "similarity", "feasibility", "why_fit", "deadline", "url"]],
+        st.session_state["grants"][["title", "sponsor", "similarity", "feasibility", "why_fit", "deadline", "url"]],
         use_container_width=True,
     )
 elif "grants" in st.session_state:
-    st.info("No grants returned from API — try again later.")
+    st.info("GPT returned no usable grants — click the button again.")
 else:
-    st.info("Click **Refresh grants & rank** to generate matches.")
+    st.info("Click **Generate & rank grants** to get matches.")
