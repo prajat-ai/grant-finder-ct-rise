@@ -135,4 +135,4 @@ if "grants" in st.session_state and not st.session_state["grants"].empty:
 elif "grants" in st.session_state:
     st.info("GPT returned no usable grants — click the button again.")
 else:
-    st.info("Click **Generate & rank grants** to get matches.")
+    st.info("Click **Generate & rank grants** to get matches.") 
