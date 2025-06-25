@@ -98,4 +98,4 @@ if "tbl" in st.session_state and not st.session_state["tbl"].empty:
 elif "tbl" in st.session_state:
     st.info("GPT returned no grants — click again.")
 else:
-    st.caption("Build tag: v2-robust  |  click the rocket to start.")
+    st.caption("Build tag: v2-robust  |  click the rocket to start.") 
