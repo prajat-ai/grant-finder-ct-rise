@@ -62,32 +62,49 @@ def gpt_brief(mission: str, grant_row: pd.Series) -> tuple[str, str]:
             time.sleep(wait)
     return "Unknown", "Could not parse GPT response."
 
-# ── 3. Grants.gov fetcher ─────────────────────────────────────────
-@st.cache_data(ttl=86400)  # cache for 1 day
+# ── 3. Grants.gov fetcher (robust) ───────────────────────────────
+@st.cache_data(ttl=86400)
 def fetch_grants(max_results: int = 25) -> pd.DataFrame:
+    """
+    Returns a DataFrame of grant listings or an empty DF if the API
+    fails. We catch JSON errors and log the raw response.
+    """
     url = "https://www.grants.gov/grantsws/rest/opportunities/search"
     payload = {
-        "keywords": "education college success high school",
-        "eligibilities": "Nonprofits",
-        "opportunityStatus": "forecasted,posted",
-        "startRecordNum": 0,
-        "sortBy": "openDate|desc",
-        "resultsPerPage": max_results,
+        "keywords": "education college readiness high school",
+        "oppStatuses": ["posted","forecasted"],   # documented field
+        "eligibilityCodes": ["25"],               # 25 = nonprofits without 501c3 (broadest)
+        "pageSize": max_results,
+        "sortField": "openDate",
+        "sortOrder": "desc"
     }
-    r = requests.post(url, json=payload, timeout=30)
-    hits = r.json().get("oppHits", [])
-    data = []
+    try:
+        r = requests.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        r.raise_for_status()            # HTTP errors → exception
+        data = r.json()
+        hits = data.get("oppHits", [])
+    except Exception as e:
+        st.error("Grants.gov API problem - showing placeholder data.")
+        st.caption(f"(debug info: {e})")
+        return pd.DataFrame()           # empty → handled downstream
+
+    records = []
     for hit in hits:
-        data.append(
+        records.append(
             {
                 "title": hit.get("oppTitle", "N/A"),
                 "agency": hit.get("agency", ""),
-                "summary": hit.get("synopsis", "")[:2000],  # truncate very long text
+                "summary": hit.get("synopsis", "")[:2000],
                 "deadline": hit.get("closeDate", "N/A"),
                 "url": hit.get("oppLink", ""),
             }
         )
-    return pd.DataFrame(data)
+    return pd.DataFrame(records)
 
 # ── 4. Rank & annotate grants ────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=3600)  # 1-hour cache
