@@ -4,6 +4,9 @@ import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
 import openai
+import os
+
+st.sidebar.write("KEY loaded:", bool(os.getenv("OPENAI_API_KEY")))
 
 # ── settings ────────────────────────────────────────────────────
 NUM_GRANTS, TOP_N = 15, 8          # fewer calls → fewer 429s
