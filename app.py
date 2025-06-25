@@ -18,8 +18,8 @@ SLEEP_SECONDS = 2         # pause between OpenAI calls (rate-limit safety)
 RETRIES       = 3         # OpenAI retry attempts
 
 # ── KEYS ─────────────────────────────────────────────────────────
-load_dotenv()                                # in case you run locally
-openai.api_key = os.getenv("OPENAI_API_KEY") # Streamlit secrets → env-var
+load_dotenv()
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 # ── CT RISE MISSION ──────────────────────────────────────────────
 CT_RISE_MISSION = (
@@ -31,19 +31,16 @@ CT_RISE_MISSION = (
 
 # ── OPENAI HELPERS ───────────────────────────────────────────────
 def get_embedding(text: str, model: str = "text-embedding-ada-002") -> list[float]:
-    """Return embedding vector with retry/back-off."""
     for attempt in range(RETRIES):
         try:
             resp = openai.Embedding.create(input=text, model=model)
             return resp["data"][0]["embedding"]
         except openai.error.RateLimitError:
-            wait = 5 * (attempt + 1)
-            time.sleep(wait)
+            time.sleep(5 * (attempt + 1))
     st.error("OpenAI rate-limit hit repeatedly.")
-    return [0.0] * 1536  # dummy vector to keep pipeline alive
+    return [0.0] * 1536
 
 def gpt_brief(mission: str, grant_row: pd.Series) -> tuple[str, str]:
-    """Return feasibility + 1-sentence rationale."""
     prompt = (
         f"Nonprofit mission:\n{mission}\n\n"
         f"Grant title: {grant_row.title}\n"
@@ -53,7 +50,7 @@ def gpt_brief(mission: str, grant_row: pd.Series) -> tuple[str, str]:
     for attempt in range(RETRIES):
         try:
             resp = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",            # works on free tier
+                model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=60,
                 temperature=0.3,
@@ -64,13 +61,12 @@ def gpt_brief(mission: str, grant_row: pd.Series) -> tuple[str, str]:
             time.sleep(5 * (attempt + 1))
     return "Unknown", "Could not parse GPT response."
 
-# ── GRANTS.GOV FETCHER (robust GET) ──────────────────────────────
-@st.cache_data(ttl=86400)     # cache for 1 day
+# ── GRANTS.GOV FETCHER ───────────────────────────────────────────
+@st.cache_data(ttl=86400)
 def fetch_grants(max_results: int = 25) -> pd.DataFrame:
     base = "https://www.grants.gov/grantsws/rest/opportunities/search"
     params = {
-        "keywords": "education college success high school",
-        "eligibilityCodes": "25",                 # 25 = nonprofits
+        "keywords": "education high school youth college success",
         "oppStatuses": "forecasted,posted",
         "sortField": "openDate",
         "sortOrder": "desc",
@@ -83,7 +79,7 @@ def fetch_grants(max_results: int = 25) -> pd.DataFrame:
         hits = r.json().get("oppHits", [])
     except Exception as e:
         logging.warning(f"Grants.gov error: {e}")
-        return pd.DataFrame()                    # empty → handled later
+        return pd.DataFrame()
 
     rows = []
     for h in hits:
@@ -99,7 +95,7 @@ def fetch_grants(max_results: int = 25) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ── RANK + GPT ANNOTATE ──────────────────────────────────────────
-@st.cache_data(show_spinner=False, ttl=3600)  # cache 1 hour
+@st.cache_data(show_spinner=False, ttl=3600)
 def process_grants(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -121,7 +117,7 @@ def process_grants(df: pd.DataFrame) -> pd.DataFrame:
         whys.append(w)
         time.sleep(SLEEP_SECONDS)
     df["feasibility"] = feasibilities
-    df["why_fit"]   = whys
+    df["why_fit"]    = whys
     return df
 
 # ── STREAMLIT UI ─────────────────────────────────────────────────
@@ -134,9 +130,9 @@ st.markdown(
 )
 
 if st.button("🔄 Refresh grants & rank"):
-    with st.spinner("Contacting Grants.gov and OpenAI… ≈1 min"):
-        raw  = fetch_grants(MAX_RESULTS)
-        ranked = process_grants(raw)
+    with st.spinner("Contacting Grants.gov and OpenAI… this can take ~1 min"):
+        raw_df   = fetch_grants(MAX_RESULTS)
+        ranked   = process_grants(raw_df)
         st.session_state["grants"] = ranked
         st.success("Updated!")
 
@@ -150,4 +146,3 @@ elif "grants" in st.session_state:
     st.info("No grants returned from API — try again later.")
 else:
     st.info("Click **Refresh grants & rank** to generate matches.")
-# ─────────────────────────────────────────────────────────────────
