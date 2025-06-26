@@ -60,22 +60,13 @@ def scrape_grant(url: str):
         "If a field is missing use 'N/A'. Respond ONLY with JSON."
     )
     raw = chat(SEARCH_MODEL, [{"role":"user","content":prompt}]).choices[0].message.content
-    # code-fenced json?
-    m = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", raw, re.S)
-    snippet = m.group(1) if m else None
-    # else first {...} or [...] non-greedy
-    if not snippet:
-        m = re.search(r"(\{.*?\}|\[.*?\])", raw, re.S)
-        snippet = m.group(1) if m else None
-    if not snippet:
-        return None
+    m = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", raw, re.S) or \
+        re.search(r"(\{.*?\}|\[.*?\])", raw, re.S)
+    if not m: return None
     try:
-        data = json.loads(snippet)
-        if isinstance(data, list):
-            data = data[0] if data else None
+        data = json.loads(m.group(1))
+        if isinstance(data, list): data = data[0]
     except Exception:
-        return None
-    if not isinstance(data, dict):
         return None
     data["url"] = url
     return {k: data.get(k,"N/A") for k in
@@ -93,7 +84,6 @@ st.set_page_config(page_title="CT RISE Grant Analyzer", layout="wide")
 st.title("CT RISE – Grant Fit Analyzer (persistent)")
 st.markdown(f"**Mission:** {MISSION}")
 
-# load persisted table once
 if "tbl" not in st.session_state:
     st.session_state["tbl"] = load_history()
 
@@ -120,7 +110,9 @@ if st.button("Analyze Grant") and url.strip():
                     f'Mission: "{MISSION}"\n\nGrant: "{g["title"]}" – {g["summary"]}\n'
                     "In 1-2 sentences, say if this is a strong fit and why."
                 )
-                rec = chat(CHAT_MODEL,[{"role":"user","content":rec_prompt}]).choices[0].message.content.strip()
+                rec = chat(CHAT_MODEL,[{"role":"user","content":rec_prompt}])\
+                      .choices[0].message.content.strip()
+
                 new_row = {
                     "Title": g["title"],
                     "Match%": round(sim,1),
@@ -145,4 +137,8 @@ st.dataframe(st.session_state["tbl"], use_container_width=True)
 if st.button("🗑️ Clear table"):
     st.session_state["tbl"] = pd.DataFrame(columns=COLS)
     save_history(st.session_state["tbl"])
-    st.success("Table cleared.")
+    # immediate refresh so user sees empty table without a second click
+    try:
+        st.rerun()
+    except AttributeError:
+        st.experimental_rerun()
