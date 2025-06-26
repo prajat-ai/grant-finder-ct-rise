@@ -1,147 +1,130 @@
-# grant_analyzer.py  –  Persistent Grant-Fit Dashboard for CT RISE
-
-import os, json, re, time, datetime as dt
+import os, json, re, time, datetime as dt, io
 import pandas as pd, streamlit as st, openai
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
+from reportlab.lib import colors
 
-# ── APP CONFIG ───────────────────────────────────────────────────
-SEARCH_MODEL = "gpt-4o-mini-search-preview"      # supports web search
+# ─── CONFIG ─────────────────────────────────────────
+SEARCH_MODEL = "gpt-4o-mini-search-preview"
 CHAT_MODEL   = "gpt-3.5-turbo"
 EMB_MODEL    = "text-embedding-ada-002"
-CSV_PATH     = "grants_history.csv"              # persistence file
-API_RETRY    = 4
-BACKOFF      = 2                                 # seconds
+CSV_PATH     = "grants_history.csv"
 MISSION = (
     "The Connecticut RISE Network empowers public high schools with data-driven strategies "
     "and personalized support to improve student outcomes and promote postsecondary success, "
     "especially for Black, Latinx, and low-income youth."
 )
 
-# ── OPENAI KEY ──────────────────────────────────────────────────
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# ─── OPENAI KEY ─────────────────────────────────────
+load_dotenv(); openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# ── RETRY DECORATOR ─────────────────────────────────────────────
+# ─── RETRY WRAPPERS ─────────────────────────────────
 def retry(fn):
-    def wrapper(*a, **k):
-        for i in range(API_RETRY):
-            try:
-                return fn(*a, **k)
-            except openai.RateLimitError:
-                time.sleep(BACKOFF * (i + 1))
-        st.error("OpenAI rate-limit; try later."); st.stop()
-    return wrapper
+    def wrap(*a, **k):
+        for i in range(4):
+            try: return fn(*a, **k)
+            except openai.RateLimitError: time.sleep(2*(i+1))
+        st.error("OpenAI rate-limit."); st.stop()
+    return wrap
 
 @retry
-def chat(model, msgs):
-    return openai.chat.completions.create(model=model, messages=msgs)
+def chat(model, msgs): return openai.chat.completions.create(model=model, messages=msgs)
 
 @retry
-def get_embed(text):
-    return openai.embeddings.create(model=EMB_MODEL, input=text).data[0].embedding
+def emb(t): return openai.embeddings.create(model=EMB_MODEL, input=t).data[0].embedding
 
-# ── CSV LOAD / SAVE ─────────────────────────────────────────────
-def load_history():
-    if os.path.exists(CSV_PATH):
-        return pd.read_csv(CSV_PATH)
-    return pd.DataFrame(columns=[
+# ─── PERSISTENCE ────────────────────────────────────
+def load_hist():
+    return pd.read_csv(CSV_PATH) if os.path.exists(CSV_PATH) else pd.DataFrame(columns=[
         "Title","Match%","Amount","Deadline","Sponsor",
         "Grant Summary","URL","Recommendation"
     ])
+def save_hist(df): df.to_csv(CSV_PATH, index=False)
 
-def save_history(df):
-    df.to_csv(CSV_PATH, index=False)
-
-# ── GRANT SCRAPER (robust JSON parser) ──────────────────────────
-def scrape_grant(url: str):
-    prompt = (
-        f"search: Visit {url} and return JSON with keys "
-        "{title, sponsor, amount, deadline (YYYY-MM-DD or 'rolling'), summary}. "
-        "If a field is missing use 'N/A'. Respond ONLY with JSON."
-    )
-    raw = chat(SEARCH_MODEL, [{"role":"user","content":prompt}]).choices[0].message.content
-
-    # 1) grab code-fenced json if present
-    m = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", raw, re.S)
-    snippet = m.group(1) if m else None
-    # 2) else first {...} or [...] non-greedy
-    if not snippet:
-        m = re.search(r"(\{.*?\}|\[.*?\])", raw, re.S)
-        snippet = m.group(1) if m else None
-    if not snippet:
-        return None
-
+# ─── SCRAPE + PARSE ─────────────────────────────────
+def scrape(url):
+    p=(f"search: Visit {url} and return JSON {{title,sponsor,amount,deadline,summary}}.")
+    raw=chat(SEARCH_MODEL,[{"role":"user","content":p}]).choices[0].message.content
+    m=re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```",raw,re.S) or re.search(r"(\{.*?\}|\[.*?\])",raw,re.S)
     try:
-        data = json.loads(snippet)
-        if isinstance(data, list):
-            data = data[0] if data else None
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
+        obj=json.loads(m.group(1) if m else raw); obj=obj[0] if isinstance(obj,list) else obj
+    except Exception: return None
+    obj["url"]=url
+    return {k:obj.get(k,"N/A") for k in("title","sponsor","amount","deadline","summary","url")}
 
-    data["url"] = url
-    return {k: data.get(k,"N/A") for k in
-            ("title","sponsor","amount","deadline","summary","url")}
-
-def future_deadline(dl: str) -> bool:
-    if dl.lower() == "rolling": return True
-    try: return dt.datetime.strptime(dl[:10], "%Y-%m-%d").date() >= dt.date.today()
+def future(dl): 
+    if dl.lower()=="rolling": return True
+    try: return dt.datetime.strptime(dl[:10],"%Y-%m-%d").date()>=dt.date.today()
     except: return False
 
-# ── STREAMLIT UI ────────────────────────────────────────────────
+# ─── PDF EXPORT ────────────────────────────────────
+def df_to_pdf(df: pd.DataFrame) -> bytes:
+    buff=io.BytesIO()
+    doc=SimpleDocTemplate(buff,pagesize=letter)
+    data=[df.columns.tolist()]+df.values.tolist()
+    table=Table(data,repeatRows=1)
+    table.setStyle(TableStyle([
+        ('GRID',(0,0),(-1,-1),0.5,colors.grey),
+        ('BACKGROUND',(0,0),(-1,0),colors.lightgrey),
+        ('FONT', (0,0),(-1,0), "Helvetica-Bold")
+    ]))
+    doc.build([table])
+    return buff.getvalue()
+
+# ─── STREAMLIT UI ───────────────────────────────────
 st.set_page_config(page_title="CT RISE Grant Analyzer", layout="wide")
-st.title("CT RISE – Grant Fit Analyzer (persistent)")
-st.markdown(f"**Mission:** {MISSION}")
+st.title("CT RISE — Grant Fit Analyzer")
+st.write("**Mission:**", MISSION)
 
-# load persisted table once
-if "tbl" not in st.session_state:
-    st.session_state["tbl"] = load_history()
+# init session
+if "tbl" not in st.session_state: st.session_state.tbl=load_hist()
 
-url = st.text_input("Paste a grant application URL")
+url=st.text_input("Paste grant URL")
 
 if st.button("Analyze Grant") and url.strip():
     with st.spinner("Analyzing…"):
-        g = scrape_grant(url.strip())
-        if not g:
-            st.error("Could not parse that URL.")
-        elif not future_deadline(g["deadline"]):
-            st.warning("Deadline already passed – skipped.")
+        g=scrape(url.strip())
+        if not g: st.error("Couldn’t parse URL.")
+        elif not future(g["deadline"]): st.warning("Deadline passed — skipped.")
+        elif (st.session_state.tbl["URL"].str.lower()==g["url"].lower()).any(): st.info("Already in table.")
         else:
-            # de-dupe
-            df = st.session_state["tbl"]
-            if ((df["URL"].str.lower() == g["url"].lower()).any() or
-                (df["Title"].str.lower() == g["title"].lower()).any()):
-                st.info("Grant already in the table.")
-            else:
-                sim = cosine_similarity(
-                    [get_embed(g["summary"])],
-                    [get_embed(MISSION)]
-                )[0][0]*100
-                rec_prompt = (
-                    f'Mission: "{MISSION}"\n\nGrant: "{g["title"]}" – {g["summary"]}\n'
-                    "In 1-2 sentences, say if this is a strong fit and why."
-                )
-                rec = chat(CHAT_MODEL,[{"role":"user","content":rec_prompt}])\
-                      .choices[0].message.content.strip()
+            sim=cosine_similarity([emb(g["summary"])],[emb(MISSION)])[0][0]*100
+            rec_prompt=(f'Mission: "{MISSION}"\nGrant: "{g["title"]}" – {g["summary"]}\n'
+                        "In 1–2 sentences, say if this is a strong fit and why.")
+            rec=chat(CHAT_MODEL,[{"role":"user","content":rec_prompt}]).choices[0].message.content.strip()
+            new_row=pd.DataFrame([{
+                "Title":g["title"],"Match%":round(sim,1),"Amount":g["amount"],
+                "Deadline":g["deadline"],"Sponsor":g["sponsor"],
+                "Grant Summary":g["summary"],"URL":g["url"],"Recommendation":rec
+            }])
+            st.session_state.tbl=pd.concat([st.session_state.tbl,new_row],ignore_index=True)
+            save_hist(st.session_state.tbl); st.success("Added & saved!")
 
-                new_row = {
-                    "Title": g["title"],
-                    "Match%": round(sim,1),
-                    "Amount": g["amount"],
-                    "Deadline": g["deadline"],
-                    "Sponsor": g["sponsor"],
-                    "Grant Summary": g["summary"],
-                    "URL": g["url"],
-                    "Recommendation": rec
-                }
-                st.session_state["tbl"] = pd.concat(
-                    [df, pd.DataFrame([new_row])],
-                    ignore_index=True
-                )
-                save_history(st.session_state["tbl"])
-                st.success("Grant added and saved!")
+st.divider()
+st.subheader("Analyzed Grants")
 
-st.subheader("Analyzed Grants (saved across sessions)")
-st.dataframe(st.session_state["tbl"], use_container_width=True)
+edit_mode=st.toggle("✏️ Edit table")
+
+if edit_mode:
+    edited=st.data_editor(st.session_state.tbl, num_rows="dynamic", use_container_width=True,
+                          key="editor")
+    del_rows=st.multiselect("Select rows to delete (by index)", edited.index.tolist())
+    col1,col2=st.columns(2)
+    if col1.button("Delete selected"):
+        edited=edited.drop(del_rows).reset_index(drop=True)
+        st.session_state.tbl=edited; save_hist(edited); st.success("Rows deleted.")
+    if col2.button("Save changes"):
+        st.session_state.tbl=edited; save_hist(edited); st.success("Table saved.")
+    show_df=edited
+else:
+    show_df=st.session_state.tbl
+
+st.dataframe(show_df,use_container_width=True)
+
+# PDF export
+if not show_df.empty:
+    pdf_bytes=df_to_pdf(show_df)
+    st.download_button("📄 Export table as PDF", data=pdf_bytes,
+                       file_name="CT_RISE_grants.pdf", mime="application/pdf")
