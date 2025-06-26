@@ -6,15 +6,19 @@ from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
 
 # ── APP CONFIG ───────────────────────────────────────────────────
-SEARCH_MODEL = "gpt-4o-mini-search-preview"      # supports web search
+SEARCH_MODEL = "gpt-4o-mini-search-preview"
 CHAT_MODEL   = "gpt-3.5-turbo"
 EMB_MODEL    = "text-embedding-ada-002"
-CSV_PATH     = "grants_history.csv"              # persistence file
+CSV_PATH     = "grants_history.csv"
 API_RETRY    = 4
-BACKOFF      = 2                                 # seconds
+BACKOFF      = 2
+COLS = [
+    "Title","Match%","Amount","Deadline","Sponsor",
+    "Grant Summary","URL","Recommendation"
+]
 MISSION = (
     "The Connecticut RISE Network empowers public high schools with data-driven strategies "
-    "and personalized support to improve student outcomes and promote postsecondary success, "
+    "and personalized support to improve student outcomes and promote post-secondary success, "
     "especially for Black, Latinx, and low-income youth."
 )
 
@@ -28,7 +32,7 @@ def retry(fn):
         for i in range(API_RETRY):
             try:
                 return fn(*a, **k)
-            except openai.RateLimitError:
+            except openai.error.RateLimitError:
                 time.sleep(BACKOFF * (i + 1))
         st.error("OpenAI rate-limit; try later."); st.stop()
     return wrapper
@@ -43,12 +47,7 @@ def get_embed(text):
 
 # ── CSV LOAD / SAVE ─────────────────────────────────────────────
 def load_history():
-    if os.path.exists(CSV_PATH):
-        return pd.read_csv(CSV_PATH)
-    return pd.DataFrame(columns=[
-        "Title","Match%","Amount","Deadline","Sponsor",
-        "Grant Summary","URL","Recommendation"
-    ])
+    return pd.read_csv(CSV_PATH) if os.path.exists(CSV_PATH) else pd.DataFrame(columns=COLS)
 
 def save_history(df):
     df.to_csv(CSV_PATH, index=False)
@@ -61,17 +60,15 @@ def scrape_grant(url: str):
         "If a field is missing use 'N/A'. Respond ONLY with JSON."
     )
     raw = chat(SEARCH_MODEL, [{"role":"user","content":prompt}]).choices[0].message.content
-
-    # 1) grab code-fenced json if present
+    # code-fenced json?
     m = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", raw, re.S)
     snippet = m.group(1) if m else None
-    # 2) else first {...} or [...] non-greedy
+    # else first {...} or [...] non-greedy
     if not snippet:
         m = re.search(r"(\{.*?\}|\[.*?\])", raw, re.S)
         snippet = m.group(1) if m else None
     if not snippet:
         return None
-
     try:
         data = json.loads(snippet)
         if isinstance(data, list):
@@ -80,15 +77,16 @@ def scrape_grant(url: str):
         return None
     if not isinstance(data, dict):
         return None
-
     data["url"] = url
     return {k: data.get(k,"N/A") for k in
             ("title","sponsor","amount","deadline","summary","url")}
 
 def future_deadline(dl: str) -> bool:
     if dl.lower() == "rolling": return True
-    try: return dt.datetime.strptime(dl[:10], "%Y-%m-%d").date() >= dt.date.today()
-    except: return False
+    try:
+        return dt.datetime.strptime(dl[:10], "%Y-%m-%d").date() >= dt.date.today()
+    except Exception:
+        return False
 
 # ── STREAMLIT UI ────────────────────────────────────────────────
 st.set_page_config(page_title="CT RISE Grant Analyzer", layout="wide")
@@ -109,7 +107,6 @@ if st.button("Analyze Grant") and url.strip():
         elif not future_deadline(g["deadline"]):
             st.warning("Deadline already passed – skipped.")
         else:
-            # de-dupe
             df = st.session_state["tbl"]
             if ((df["URL"].str.lower() == g["url"].lower()).any() or
                 (df["Title"].str.lower() == g["title"].lower()).any()):
@@ -123,9 +120,7 @@ if st.button("Analyze Grant") and url.strip():
                     f'Mission: "{MISSION}"\n\nGrant: "{g["title"]}" – {g["summary"]}\n'
                     "In 1-2 sentences, say if this is a strong fit and why."
                 )
-                rec = chat(CHAT_MODEL,[{"role":"user","content":rec_prompt}])\
-                      .choices[0].message.content.strip()
-
+                rec = chat(CHAT_MODEL,[{"role":"user","content":rec_prompt}]).choices[0].message.content.strip()
                 new_row = {
                     "Title": g["title"],
                     "Match%": round(sim,1),
@@ -145,3 +140,9 @@ if st.button("Analyze Grant") and url.strip():
 
 st.subheader("Analyzed Grants (saved across sessions)")
 st.dataframe(st.session_state["tbl"], use_container_width=True)
+
+# ---------- CLEAR TABLE BUTTON ----------
+if st.button("🗑️ Clear table"):
+    st.session_state["tbl"] = pd.DataFrame(columns=COLS)
+    save_history(st.session_state["tbl"])
+    st.success("Table cleared.")
