@@ -93,7 +93,7 @@ def build_table(rows):
 st.title("Final Capstone Project (Grant Matcher for CT RISE using ChatGPT Search)")
 st.write("> **Mission:**", MISSION)
 
-if st.button("🚀 Generate & Rank 10 Grants", type="primary"):
+if st.button("🚀 Generate & Rank 10 Grantss", type="primary"):
     with st.spinner("GPT-4o is searching and compiling grants…"):
         grants = get_grants()
         if len(grants) < N_GRANTS:
