@@ -1,16 +1,16 @@
-# Final Capstone Project (Grant Matcher for CT RISE — GPT-4o Search)
+# Final Capstone Project (Grant Matcher for CT RISE — GPT-4o Search, tool-enabled)
 
-import os, json, re, time, pandas as pd, streamlit as st, openai
+import os, time, json, re, pandas as pd, streamlit as st, openai
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
 
-# ---------- CONFIG -------------------------------------------------
-MODEL_SEARCH = "gpt-4o-mini-search-preview"   # shown in your quota screen
-MODEL_CHAT   = "gpt-3.5-turbo"                # for short follow-ups
+# ─── CONFIG ───────────────────────────────────────────
+SEARCH_MODEL = "gpt-4o-mini-search-preview"   # supports built-in search tool
+CHAT_MODEL   = "gpt-3.5-turbo"
 EMB_MODEL    = "text-embedding-ada-002"
-N_GRANTS     = 10
-OPENAI_RETRY = 4
-BACKOFF      = 2                              # seconds
+NEEDED       = 10
+RETRIES      = 4
+PAUSE        = 2
 
 MISSION = (
     "The Connecticut RISE Network empowers public high schools with data-driven strategies "
@@ -18,88 +18,85 @@ MISSION = (
     "especially for Black, Latinx, and low-income youth."
 )
 
-# ---------- KEYS ---------------------------------------------------
+# ─── KEYS ─────────────────────────────────────────────
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# ---------- OPENAI WRAPPERS ---------------------------------------
-def chat(model, messages, **kwargs):
-    for a in range(OPENAI_RETRY):
+# ─── HELPERS ─────────────────────────────────────────
+def chat(model, messages, **kw):
+    for a in range(RETRIES):
         try:
-            resp = openai.ChatCompletion.create(model=model,
-                                                messages=messages,
-                                                temperature=0.25,
-                                                **kwargs)
-            return resp.choices[0].message.content
+            resp = openai.ChatCompletion.create(model=model, messages=messages, **kw)
+            return resp
         except openai.error.RateLimitError:
-            time.sleep(BACKOFF * (a + 1))
-    st.error("OpenAI rate-limit hit repeatedly."); st.stop()
+            time.sleep(PAUSE * (a + 1))
+    st.error("OpenAI rate-limited."); st.stop()
 
-def embed(text):
-    for a in range(OPENAI_RETRY):
+def embed(txt):
+    for a in range(RETRIES):
         try:
-            return openai.Embedding.create(input=text, model=EMB_MODEL)["data"][0]["embedding"]
+            return openai.Embedding.create(input=txt, model=EMB_MODEL)["data"][0]["embedding"]
         except openai.error.RateLimitError:
-            time.sleep(BACKOFF * (a + 1))
-    st.error("OpenAI embedding rate-limit."); st.stop()
+            time.sleep(PAUSE * (a + 1))
+    st.error("Embedding rate-limited."); st.stop()
 
-# ---------- STEP 1: single GPT-4o search call ----------------------
-def get_grants():
-    user = (
-        f"Using your web-search capabilities, provide EXACTLY {N_GRANTS} current grant "
-        "opportunities suitable for US nonprofits focused on high-school education, youth equity "
-        "or college readiness. Return ONLY a valid JSON array; each object MUST have keys "
+# ─── STEP 1: one call to SEARCH model ───────────────
+def fetch_grants():
+    prompt = (
+        f"Search the web and return exactly {NEEDED} current US grant opportunities for "
+        "nonprofits working on high-school education, youth equity, or college readiness. "
+        "Output ONLY a JSON array where each element has keys: "
         "title, sponsor, amount, deadline, url, summary."
     )
-    raw = chat(MODEL_SEARCH,
-               [{"role":"user","content": user}],
-               response_format={"type":"json_object"},
-               max_tokens=1500)
+    resp = chat(
+        SEARCH_MODEL,
+        messages=[{"role":"user","content":prompt}],
+        tools=[{"type":"search"}],          # allow the internal search tool
+        tool_choice="auto",
+        temperature=0.3,
+        max_tokens=1400
+    )
+    content = resp.choices[0].message.content
 
     # robust parse
     try:
-        data = json.loads(raw)
+        data = json.loads(content)
     except json.JSONDecodeError:
-        match = re.search(r"\[.*\]", raw, re.S)
-        data = json.loads(match.group()) if match else []
-    cleaned = []
-    for d in data:
-        cleaned.append({k: d.get(k, "N/A") for k in
-                        ("title","sponsor","amount","deadline","url","summary")})
-    return cleaned[:N_GRANTS]
+        m = re.search(r"\[.*\]", content, re.S)
+        data = json.loads(m.group()) if m else []
+    cleaned = [{k: d.get(k, "N/A") for k in
+               ("title","sponsor","amount","deadline","url","summary")} for d in data]
+    return cleaned[:NEEDED]
 
-# ---------- STEP 2: rank & add Why-Fit -----------------------------
-def build_table(rows):
-    df = pd.DataFrame(rows)
+# ─── STEP 2: rank + “Why Fit” ───────────────────────
+def rank(df):
     mvec = embed(MISSION)
     df["%Match"] = (
-        df.summary.apply(lambda s: cosine_similarity([embed(s)], [mvec])[0][0]*100)
-        .round(1)
+        df.summary.apply(lambda s: cosine_similarity([embed(s)], [mvec])[0][0]*100).round(1)
     )
     df = df.sort_values("%Match", ascending=False).reset_index(drop=True)
     df.index = df.index + 1
     df.insert(0,"Rank", df.index)
 
-    # Why-Fit sentence via cheap chat model
     whys=[]
-    for _, r in df.iterrows():
-        prompt = (f'In one sentence: why does the grant titled "{r.title}" align with this mission: '
-                  f'"{MISSION}"?')
-        whys.append(chat(MODEL_CHAT, [{"role":"user","content": prompt}], max_tokens=60).strip())
+    for _, row in df.iterrows():
+        q = (f'In one sentence: why does "{row.title}" align with the mission "{MISSION}"?')
+        ans = chat(CHAT_MODEL, [{"role":"user","content":q}], max_tokens=60).choices[0].message.content.strip()
+        whys.append(ans)
     df["Why Fit"] = whys
     return df
 
-# ---------- STREAMLIT UI ------------------------------------------
+# ─── UI ─────────────────────────────────────────────
 st.title("Final Capstone Project (Grant Matcher for CT RISE using ChatGPT Search)")
 st.write("> **Mission:**", MISSION)
 
-if st.button("🚀 Generate & Rank 10 Grantss", type="primary"):
+if st.button("🚀 Generate & Rank 10 Grantz", type="primary"):
     with st.spinner("GPT-4o is searching and compiling grants…"):
-        grants = get_grants()
-        if len(grants) < N_GRANTS:
-            st.error("GPT-4o could not find enough complete grants – try again.")
+        rows = fetch_grants()
+        if len(rows) < NEEDED:
+            st.error("Model returned fewer than 10 grants. Click again.")
         else:
-            st.session_state["tbl"] = build_table(grants)
+            st.session_state["tbl"] = rank(pd.DataFrame(rows))
             st.success("Done!")
 
 if "tbl" in st.session_state:
@@ -110,4 +107,4 @@ if "tbl" in st.session_state:
         use_container_width=True
     )
 else:
-    st.caption("Press the rocket to generate your ranked grant list.")
+    st.caption("Press the rocket to generate a ranked list.")
