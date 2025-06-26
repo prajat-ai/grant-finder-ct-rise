@@ -1,117 +1,113 @@
-# Final Capstone Project – CT RISE Grant Matcher (GPT-4o Search, future deadlines only)
-
-import os, json, re, time, datetime as dt, pandas as pd, streamlit as st, openai
+import os, json, re, time, datetime as dt
+import pandas as pd, streamlit as st, openai
 from sklearn.metrics.pairwise import cosine_similarity
 from dotenv import load_dotenv
 
-# ── CONFIG ──────────────────────────────────
-SEARCH_MODEL = "gpt-4o-mini-search-preview"
+# ––––– CONFIG –––––
+SEARCH_MODEL = "gpt-4o-mini-search-preview"   # web-search capable
 CHAT_MODEL   = "gpt-3.5-turbo"
 EMB_MODEL    = "text-embedding-ada-002"
-TARGET       = 10           # want 10 rows
-ASK_FOR      = 20           # request 20, keep ≥10
-MAX_TRY      = 6
-RETRY_API    = 4
-BACKOFF      = 2            # sec
+
+NEEDED   = 10    # rows in final table
+ASK_FOR  = 20    # ask for extras
+MAX_TRY  = 6     # prompt retries
+API_RETRY= 4
+SLEEP    = 2     # sec back-off
 
 MISSION = (
     "The Connecticut RISE Network empowers public high schools with data-driven strategies "
-    "and personalized support to improve student outcomes and promote post-secondary success, "
+    "and personalized support to improve student outcomes and promote postsecondary success, "
     "especially for Black, Latinx, and low-income youth."
 )
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# ── UTILS ─────────────────────────────────────
+# ––––– HELPERS –––––
 def retry(fn):
     def wrap(*a, **k):
-        for i in range(RETRY_API):
-            try:
-                return fn(*a, **k)
-            except openai.RateLimitError:
-                time.sleep(BACKOFF * (i + 1))
-        st.error("OpenAI rate-limit; try later."); st.stop()
+        for i in range(API_RETRY):
+            try: return fn(*a, **k)
+            except openai.RateLimitError: time.sleep(SLEEP*(i+1))
+        st.error("OpenAI rate-limit — try later."); st.stop()
     return wrap
 
 @retry
-def embed(txt):  # embedding call
-    return openai.embeddings.create(model=EMB_MODEL, input=txt).data[0].embedding
-
-@retry
-def chat(model, msgs):  # chat call
+def ask(model, msgs):                 # chat wrapper
     return openai.chat.completions.create(model=model, messages=msgs)
 
-# ── 1 · fetch grants via search-preview ───────
-def fetch_grants():
-    today = dt.date.today().isoformat()
-    base_prompt = (
-        f"search: Provide {ASK_FOR} CURRENT grant opportunities for US nonprofits focused on "
-        "high-school education, youth equity, or college readiness. EXCLUDE grants whose "
-        f"deadline is before {today}. For each, return JSON with keys: "
-        "title, sponsor, amount, deadline (YYYY-MM-DD or 'rolling'), "
-        "url (direct apply link), summary."
+@retry
+def emb(text):                        # embedding wrapper
+    return openai.embeddings.create(model=EMB_MODEL, input=text).data[0].embedding
+
+# ––––– 1 · FETCH & DEDUP –––––
+def fetch_unique():
+    prompt = (
+        f"search: Provide {ASK_FOR} CURRENT US grant opportunities (Apply-Now link included) "
+        f"for nonprofits in high-school education, youth equity, or college readiness. "
+        f"Exclude any grant whose deadline is before {dt.date.today()}. "
+        "Return ONLY a JSON array. Keys: title, sponsor, amount, deadline (YYYY-MM-DD "
+        "or 'rolling'), url (direct apply link), summary."
     )
+    titles_seen, urls_seen, rows = set(), set(), []
     for _ in range(MAX_TRY):
-        txt = chat(SEARCH_MODEL, [{"role":"user","content":base_prompt}]).choices[0].message.content
-        try:
-            data = json.loads(txt)
+        raw = ask(SEARCH_MODEL, [{"role":"user","content":prompt}]).choices[0].message.content
+        try: data = json.loads(raw)
         except json.JSONDecodeError:
-            m = re.search(r"\[.*\]", txt, re.S)
-            data = json.loads(m.group()) if m else []
-        # validate & filter future deadlines
-        rows=[]
+            m = re.search(r"\[.*\]", raw, re.S); data = json.loads(m.group()) if m else []
+
+        today = dt.date.today()
         for d in data:
-            g={k: d.get(k,"N/A") for k in
-               ("title","sponsor","amount","deadline","url","summary")}
-            dl=g["deadline"].lower()
-            keep=True
-            if dl!="rolling":
-                try:
-                    keep = dt.datetime.strptime(dl[:10], "%Y-%m-%d").date() >= dt.date.today()
-                except Exception:
-                    keep = False
-            if keep: rows.append(g)
-            if len(rows)==TARGET: break
-        if len(rows)>=TARGET: return rows
-    return rows  # may be <10 after retries
+            g = {k: d.get(k, "N/A") for k in
+                 ("title","sponsor","amount","deadline","url","summary")}
+            # future deadline check
+            future = True
+            dl = g["deadline"].lower()
+            if dl != "rolling":
+                try:  future = dt.datetime.strptime(dl[:10],"%Y-%m-%d").date() >= today
+                except: future = False
+            # de-dupe by title OR url
+            tkey = g["title"].strip().lower(); ukey = g["url"].strip().lower()
+            if future and tkey not in titles_seen and ukey not in urls_seen:
+                rows.append(g); titles_seen.add(tkey); urls_seen.add(ukey)
+            if len(rows) == NEEDED: return rows
+    return rows   # may be <10 after retries
 
-# ── 2 · rank & add “Why It Fits” ───────────────
-def rank_table(rows):
-    df=pd.DataFrame(rows)
-    base_vec=embed(MISSION)
-    df["Match%"]=(df.summary.apply(lambda s:
-        cosine_similarity([embed(s)], [base_vec])[0][0]*100).round(1))
-    df=df.sort_values("Match%",ascending=False).head(TARGET).reset_index(drop=True)
+# ––––– 2 · RANK & ADD “WHY” –––––
+def make_table(raw):
+    df = pd.DataFrame(raw)
+    base_vec = emb(MISSION)
+    df["Match%"] = (df.summary.apply(lambda s:
+        cosine_similarity([emb(s)], [base_vec])[0][0]*100).round(1))
+    df = df.sort_values("Match%", ascending=False).reset_index(drop=True)
 
-    # why-fit
     whys=[]
-    for _,r in df.iterrows():
-        q=(f'In one sentence, why does the grant "{r.title}" align with the mission '
-           f'"{MISSION}"?')
-        whys.append(chat(CHAT_MODEL,[{"role":"user","content":q}])
-                    .choices[0].message.content.strip())
-    df["Why It Fits"]=whys
+    for _, r in df.iterrows():
+        q = (f'In one sentence: why does the grant "{r.title}" align with '
+             f'the mission "{MISSION}"?')
+        whys.append(ask(CHAT_MODEL,[{"role":"user","content":q}])
+                     .choices[0].message.content.strip())
+    df["Why It Fits"] = whys
 
-    # reorder columns
+    # reorder & rename columns
     return df[["title","Match%","amount","deadline",
                "sponsor","summary","url","Why It Fits"]].rename(columns={
         "title":"Title","amount":"Amount","deadline":"Deadline",
         "sponsor":"Sponsor","summary":"Grant Summary","url":"URL"
     })
 
-# ── UI ──────────────────────────────────────────
+# ––––– STREAMLIT APP –––––
 st.title("Final Capstone Project (Grant Matcher for CT RISE – GPT-4o Search)")
 st.write("> **Mission:**", MISSION)
 
 if st.button("🚀 Generate & Rank 10 Grants", type="primary"):
-    with st.spinner("GPT-4o searching and compiling grants…"):
-        grants=fetch_grants()
-        if len(grants)<TARGET:
-            st.error("Couldn’t gather 10 future-deadline grants. Click again.")
+    with st.spinner("GPT-4o searching web and compiling unique future-deadline grants …"):
+        grants = fetch_unique()
+        if len(grants) < NEEDED:
+            st.error(f"Only found {len(grants)} unique future-deadline grants. Click again.")
         else:
-            st.session_state["tbl"]=rank_table(grants)
-            st.success("Done!")
+            st.session_state["tbl"] = make_table(grants)
+            st.success("Table ready!")
 
 if "tbl" in st.session_state:
     st.dataframe(st.session_state["tbl"], use_container_width=True)
