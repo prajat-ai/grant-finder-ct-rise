@@ -101,7 +101,7 @@ def process(df_raw: pd.DataFrame):
     return ranked
 
 # ── UI ─────────────────────────────────────────────
-st.title("Final Capstone Project (Grant Matcher for CT RISE)")
+st.title("Final Capstone Project (Grant Matcher for CT RISE using ChatGPT Search)")
 st.write("> **Mission:**", MISSION)
 
 if st.button("🚀 Generate & Rank 10 Grants", type="primary"):
